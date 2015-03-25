@@ -38,11 +38,37 @@ static int write_file(const char *fname, int format, short *samples_arr, long nu
     return ERRCODE_SUCCESS;
 }
 
+static int calc_cutoffs(fftw_complex *data, int *cutoffs, int start, int end, int cut_ind, int num_cutoffs){
+    //notes on the input: cutoffs is an array of (num_cutoffs * 2) - 1 elements, which will store the
+    //cutoffs indices based on the weighted average of values in data, and thus will allow the
+    //partitioning of the data into (num_cutoffs * 2) groups
+    //this method also assumes that num_cutoffs is a power of 2
+    double numer, denom;
+    int cut = 0;
+    numer = 0; denom = 0;
+    for (int i = start; i < end; i++){
+        double norm = data[i][0] * data[i][0] + data[i][1] * data[i][1];
+        numer += i * norm;
+        denom += norm;
+    }
+    cut = (int)(numer/denom);
+    cutoffs[cut_ind] = cut;
+    num_cutoffs /= 2;
+    if (num_cutoffs >= 1){
+        int cut_before, cut_after;
+        cut_before = cut_ind - num_cutoffs;
+        cut_after = cut_ind + num_cutoffs;
+        calc_cutoffs(data, cutoffs, start, cut, cut_before, num_cutoffs);
+        calc_cutoffs(data, cutoffs, cut, end, cut_after, num_cutoffs);
+    }
+    return ERRCODE_SUCCESS;
+}
+
 /** 
 TODO: figure out frequency cutoffs (linearly is not gonna work, logarithmic would probably work, 
-but something based on frequency statistics of the source waveform might work the best.
+but something based on frequency statistics of the source waveform might work the best)
 **/
-static int freq_bin(short *samples_arr, long num_samples, int num_bins, short *freq_cutoffs, short ***freq_filtered){
+static int freq_bin(short *samples_arr, long num_samples, int num_bins, int *freq_cutoffs, short ***freq_filtered){
     double *samples;
     double **samples_idfts;
     fftw_complex *samples_dft;
@@ -94,9 +120,9 @@ static int freq_bin(short *samples_arr, long num_samples, int num_bins, short *f
     }
     **/
     
-    ///**
+    /**
     //split the frequency data up into bins logarithmically
-    //(well, it's really just a square root to approximate log behavior)
+    //(well, it's really just a quad root to approximate log behavior)
     for (long i = 0; i < transform_size; i++){
         int bin_index = (int)(sqrt(sqrt(((double)(i))/transform_size))*num_bins);
         if (bin_index >= num_bins){
@@ -104,16 +130,31 @@ static int freq_bin(short *samples_arr, long num_samples, int num_bins, short *f
         }
         memcpy(bin_dfts[bin_index][i], samples_dft[i], sizeof(fftw_complex));
     }
-    //**/
+    **/
     
-    /**
+    ///**
     //split data into quartiles based on weighted averages of the values in the dft
     //(i.e. if the waveform is bass-heavy, then the splits would be mostly at lower frequencies,
     //while if the waveform is treble-heavy, the splits/cutoffs would be higher)
     //alternatively, approximate the split locations by taking the locations with the
     //largest values in the dft
-    //TODO
-    **/
+    //ASSUMPTION: num_bins is a power of 2
+    {
+        int num_cutoffs = num_bins - 1;
+        freq_cutoffs = new int[num_cutoffs];
+        calc_cutoffs(samples_dft, freq_cutoffs, 0, transform_size, num_cutoffs/2, num_bins/2);
+        {
+            int bin_index = 0;
+            for (long i = 0; i < transform_size; i++){
+                while (bin_index < num_cutoffs && i > freq_cutoffs[bin_index]){
+                    bin_index += 1;
+                }
+                memcpy(bin_dfts[bin_index][i], samples_dft[i], sizeof(fftw_complex));
+            }
+        }
+        delete[] freq_cutoffs;
+    }
+    //**/
     
     //run idft on the bin_dfts, placing them into their respective samples_idfts bin
     for (int i = 0; i < num_bins; i++){

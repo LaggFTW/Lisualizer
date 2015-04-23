@@ -39,7 +39,7 @@ class ProcessedWaveform{
 
 /**
  TODO:
- Classes/structures for GUI system w/ wxWidgets
+ Classes/structures for GUI system w/ GLFW and/or CEGUI
  Classes/structures to handle Visualization calculations + rendering w/ OpenGL
 **/
 

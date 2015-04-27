@@ -53,7 +53,9 @@
 
 #define MILLION_INT 1000000
 
-#define WINDOW_SIZE 16384
+#define WINDOW_SIZE 4096
+
+#define MOV_AVG_WINDOW_SIZE 4096
 
 #define FRAME_RATE 60
 
@@ -63,9 +65,14 @@
 //distance between left and right audio receivers (in this case, ears), scaled by a damping factor
 #define HEAD_WIDTH 0.35
 
+//maximum interaural level difference, as a normalized ratio
+#define MAX_ILD 2
+
 //flag: 1 for a hanning window, 0 for a rectangular window
 #define HANNING 1
 
+//average value of squared hanning window
+#define HANN_SCALING_FACTOR 0.375
 
 typedef struct timeval timeval;
 
@@ -88,11 +95,17 @@ fftw_plan plan[2];
 fftw_plan plancorre;
 float samples[WINDOW_SIZE*2];
 int transform_size;
+int cutoff_1600; //index of dft coefficient corresponding to 1600 Hz
 
 //separation cutoff data
 fftw_complex *dft_bin[2];
-int *freq_cutoffs[2];
+int *freq_cutoffs;
 int num_bins, num_cutoffs;
+
+//visualization data
+double *source_sines; //sine of the source angles
+double *power_spectra; //current power spectrum per bin (separated "sound")
+double *pspec_mov_avg; //moving average of previously obtained power spectra per bin
 
 //audio stream data
 SNDFILE* inputfile;
@@ -170,18 +183,20 @@ static int pa_callback(const void *inputBuffer, void *outputBuffer,
     return paContinue;
 }
 
-static int calc_cutoffs(fftw_complex *data, int *cutoffs, int start, int end, int cut_ind, int num_cutoffs){
+static int calc_cutoffs_2ch(fftw_complex *data[2], int *cutoffs, int start, int end, int cut_ind, int num_cutoffs){
     //notes on the input: cutoffs is an array of (num_cutoffs * 2) - 1 elements, which will store the
-    //cutoffs indices based on the weighted average of values in data, and thus will allow the
-    //partitioning of the data into (num_cutoffs * 2) groups
+    //cutoffs indices based on the weighted average of values in the two channels of data,
+    //and thus will allow the partitioning of the data into (num_cutoffs * 2) groups
     //this method also assumes that num_cutoffs is a power of 2
     double numer, denom;
     int cut = 0;
     numer = 0; denom = 0;
-    for (int i = start; i < end; i++){
-        double norm = data[i][0] * data[i][0] + data[i][1] * data[i][1];
-        numer += i * norm;
-        denom += norm;
+    for (int ch = 0; ch < 2; ch++){
+        for (int i = start; i < end; i++){
+            double norm = data[ch][i][0] * data[ch][i][0] + data[ch][i][1] * data[ch][i][1];
+            numer += i * norm;
+            denom += norm;
+        }
     }
     cut = (denom > 0.0 || denom < 0.0)? (int)(numer/denom) : ((start + end)/2);
     cutoffs[cut_ind] = cut;
@@ -190,10 +205,17 @@ static int calc_cutoffs(fftw_complex *data, int *cutoffs, int start, int end, in
         int cut_before, cut_after;
         cut_before = cut_ind - num_cutoffs;
         cut_after = cut_ind + num_cutoffs;
-        calc_cutoffs(data, cutoffs, start, cut, cut_before, num_cutoffs);
-        calc_cutoffs(data, cutoffs, cut, end, cut_after, num_cutoffs);
+        calc_cutoffs_2ch(data, cutoffs, start, cut, cut_before, num_cutoffs);
+        calc_cutoffs_2ch(data, cutoffs, cut, end, cut_after, num_cutoffs);
     }
     return ERRCODE_SUCCESS;
+}
+
+//updates the moving average of power spectrum peaks, using a simple moving average approximation
+static void mov_avg_update(){
+    for (int i = 0; i < num_bins; i++){
+        pspec_mov_avg[i] += (power_spectra[i] - pspec_mov_avg[i])/MOV_AVG_WINDOW_SIZE;
+    }
 }
 
 static int init(const char *fname){
@@ -202,8 +224,12 @@ static int init(const char *fname){
     //information for separation
     num_bins = 4;
     num_cutoffs = num_bins - 1;
-    freq_cutoffs[0] = (int *)(calloc(num_cutoffs, sizeof(int)));
-    freq_cutoffs[1] = (int *)(calloc(num_cutoffs, sizeof(int)));
+    freq_cutoffs = (int *)(ucalloc(num_cutoffs, sizeof(int)));
+    
+    //information for visualization
+    source_sines = (double *)(ucalloc(num_bins, sizeof(double)));
+    power_spectra = (double *)(ucalloc(num_bins, sizeof(double)));
+    pspec_mov_avg = (double *)(ucalloc(num_bins, sizeof(double)));
     
     /**
     Intial opening of file
@@ -245,6 +271,7 @@ static int init(const char *fname){
     Sliding Window Initialization
     **/
     transform_size = WINDOW_SIZE/2 + 1;
+    cutoff_1600 = (int)((3200.0/samplerate) * (WINDOW_SIZE/2)); //cutoff = 1600 / nyquist freq * max transform index
     window_increment = samplerate / FRAME_RATE * 2; //for static window shift, if needed
     for (int i = 0; i < 2; i++){
         window[i] = (double *)(fftw_malloc(sizeof(double)*WINDOW_SIZE));
@@ -279,6 +306,11 @@ static int analyze(){
     dyn_win_shift = PaUtil_GetRingBufferReadAvailable(&sample_buffer);
     dyn_win_shift -= dyn_win_shift % 2; //ensure the number of samples shifted is a multiple of the number of channels (2)
     orig_win_offset = WINDOW_SIZE * 2 - dyn_win_shift;
+    //bounds checking (pray that the below if block never executes)
+    if (orig_win_offset < 0){
+        orig_win_offset = 0;
+        dyn_win_shift = WINDOW_SIZE * 2;
+    }
     //shift over the old samples by dyn_win_shift
     for (int j = 0; j < orig_win_offset; j+=2){
         samples[j] = samples[j+dyn_win_shift];
@@ -301,12 +333,11 @@ static int analyze(){
     fftw_execute(plan[0]);
     fftw_execute(plan[1]);
     //separation of the DFTs
-    calc_cutoffs(dft_window[0], freq_cutoffs[0], 0, transform_size, num_cutoffs/2, num_bins/2);
-    calc_cutoffs(dft_window[1], freq_cutoffs[1], 0, transform_size, num_cutoffs/2, num_bins/2);
+    calc_cutoffs_2ch(dft_window, freq_cutoffs, 0, transform_size, num_cutoffs/2, num_bins/2);
     for (int i = 0; i < num_bins; i++){
         for (int k = 0; k < 2; k++){
             for (int j = 0; j < transform_size; j++){
-                if ((i == 0 || j > freq_cutoffs[k][i-1]) && (i == num_cutoffs || j <= freq_cutoffs[k][i])){
+                if ((i == 0 || j > freq_cutoffs[i-1]) && (i == num_cutoffs || j <= freq_cutoffs[i])){
                     memcpy(dft_bin[k][j], dft_window[k][j], sizeof(fftw_complex));
                 } else {
                     dft_bin[k][j][0] = 0;
@@ -314,6 +345,7 @@ static int analyze(){
                 }
             }
         }
+        //TODO: Add interaural level difference checking for bins representing audio above ~1600 Hz instead of cross-correlation
         //localization (take cross-correlation of the left and right using the DFTs already computed, compute a source angle)
         //negative angle: to the left, positive angle: to the right
         for (int j = 0; j < transform_size; j++){
@@ -373,19 +405,25 @@ static int analyze(){
 /**
 Sliding Window Analysis, no synchronization
 **/
-static int analyze_async(){
+static void analyze_async(){
     /**
     Processing of current buffer waveform
     Current method uses a dynamic window, where the size is determined by
     how many samples are ready to be read from the ring buffer
     **/
     long dyn_win_shift, orig_win_offset;
+    double window_sq; //stores value of WINDOW_SIZE ^ 2 for optimized analysis
     int i;
     //dyn_win_shift: the number of samples (frames * channels) to shift the window
     //orig_win_offset: the index of the first new sample
     dyn_win_shift = PaUtil_GetRingBufferReadAvailable(&sample_buffer);
     dyn_win_shift -= dyn_win_shift % 2; //ensure the number of samples shifted is a multiple of the number of channels (2)
     orig_win_offset = WINDOW_SIZE * 2 - dyn_win_shift;
+    //bounds checking (pray that the below if block never executes)
+    if (orig_win_offset < 0){
+        orig_win_offset = 0;
+        dyn_win_shift = WINDOW_SIZE * 2;
+    }
     //shift over the old samples by dyn_win_shift
     for (int j = 0; j < orig_win_offset; j+=2){
         samples[j] = samples[j+dyn_win_shift];
@@ -408,12 +446,14 @@ static int analyze_async(){
     fftw_execute(plan[0]);
     fftw_execute(plan[1]);
     //separation of the DFTs
-    calc_cutoffs(dft_window[0], freq_cutoffs[0], 0, transform_size, num_cutoffs/2, num_bins/2);
-    calc_cutoffs(dft_window[1], freq_cutoffs[1], 0, transform_size, num_cutoffs/2, num_bins/2);
-    for (int i = 0; i < num_bins; i++){
+    calc_cutoffs_2ch(dft_window, freq_cutoffs, 0, transform_size, num_cutoffs/2, num_bins/2);
+    for (i = 0; i < num_bins; i++){
+        double diff, intensity; //values to be used for ILD
+        int loc_method = 0; //determines whether to use ITD or ILD
+        power_spectra[i] = 0.0; //reset the current power spectrum values
         for (int k = 0; k < 2; k++){
             for (int j = 0; j < transform_size; j++){
-                if ((i == 0 || j > freq_cutoffs[k][i-1]) && (i == num_cutoffs || j <= freq_cutoffs[k][i])){
+                if ((i == 0 || j > freq_cutoffs[i-1]) && (i == num_cutoffs || j <= freq_cutoffs[i])){
                     memcpy(dft_bin[k][j], dft_window[k][j], sizeof(fftw_complex));
                 } else {
                     dft_bin[k][j][0] = 0;
@@ -421,17 +461,68 @@ static int analyze_async(){
                 }
             }
         }
-        //localization (take cross-correlation of the left and right using the DFTs already computed, compute a source angle)
-        //negative angle: to the left, positive angle: to the right
-        for (int j = 0; j < transform_size; j++){
-            dft_corre[j][0] = (dft_bin[0][j][0] * dft_bin[1][j][0] + dft_bin[0][j][1] * dft_bin[1][j][1])/WINDOW_SIZE;
-            dft_corre[j][1] = (dft_bin[0][j][0] * dft_bin[1][j][1] - dft_bin[0][j][1] * dft_bin[1][j][0])/WINDOW_SIZE;
+        if (i > 0){
+            if (freq_cutoffs[i-1] >= cutoff_1600){
+                loc_method = 1;
+                diff = 0.0;
+                intensity = 0.0;
+            } else {
+                if (i < num_cutoffs && (freq_cutoffs[i-1] + freq_cutoffs[i]) >= (cutoff_1600 * 2)){
+                    loc_method = 1;
+                    diff = 0.0;
+                    intensity = 0.0;
+                }
+            }
         }
-        fftw_execute(plancorre);
-        {
+        /**
+        This loop does two things
+        1. Computes peak power of this bin
+        2. Uses a sound localization method to find a source angle (done in two ways):
+        Audio below ~1600 Hz: take cross-correlation of the left and right using the DFTs already computed, compute a source angle
+            negative angle: to the left, positive angle: to the right
+        Audio above ~1600 Hz: checks interaural level difference between left and right bins
+        **/
+        window_sq = WINDOW_SIZE * WINDOW_SIZE;
+        for (int j = 0; j < transform_size; j++){
+            double norm_l, norm_r, norm_a;
+            norm_l = (dft_bin[0][j][0] * dft_bin[0][j][0] + dft_bin[0][j][1] * dft_bin[0][j][1])/(HANN_SCALING_FACTOR * window_sq);
+            norm_r = (dft_bin[1][j][0] * dft_bin[1][j][0] + dft_bin[1][j][1] * dft_bin[1][j][1])/(HANN_SCALING_FACTOR * window_sq);
+            norm_a = (norm_l + norm_r) / 2;
+            //compute peak power
+            if (norm_a > power_spectra[i]){
+                power_spectra[i] = norm_a;
+            }
+            //prepare for sound localization
+            if (loc_method){
+                //audio above ~1600 Hz: use ILD
+                diff += norm_r - norm_l;
+                intensity += norm_a;
+            } else {
+                //audio below ~1600 Hz: use ITD, prepare for cross-correlation
+                dft_corre[j][0] = (dft_bin[0][j][0] * dft_bin[1][j][0] + dft_bin[0][j][1] * dft_bin[1][j][1])/window_sq;
+                dft_corre[j][1] = (dft_bin[0][j][0] * dft_bin[1][j][1] - dft_bin[0][j][1] * dft_bin[1][j][0])/window_sq;
+            }
+        }
+        if (loc_method){
+            //ILD
+            double ratio;
+            diff = (intensity > 0.0)? diff/intensity : 0.0;
+            ratio = diff / MAX_ILD;
+            if (ratio > 1.0){
+                ratio = 1.0;
+            }
+            if (ratio < -1.0){
+                ratio = -1.0;
+            }
+            source_sines[i] = ratio;
+        } else {
+            //ITD w/ cross-correlation
             long max_index = 0;
             long max_delay, delay_value;
-            double angle, factor, ratio;
+            double factor, ratio;
+            
+            fftw_execute(plancorre); //finish computing cross-correlation
+            
             factor = SOUND_SPEED / (samplerate * HEAD_WIDTH);
             //maximum possible delay such that the angle calculated will be 90 degrees; 
             //used to distinguish between delay caused by sound coming in from an angle 
@@ -456,14 +547,10 @@ static int analyze_async(){
             if (ratio < -1.0){
                 ratio = -1.0;
             }
-            angle = asin(ratio);
-            //printf("bin %d sample offset: %ld\n", i, value);
-            //printf("if the value is negative, then the left precedes the right by the absolute value\n");
-            //printf("otherwise, the right precedes the left by the value shown\n");
-            printf("%lf, ", angle);//DEBUG
+            //angle = asin(ratio); //we don't actually need the angle for rendering
+            source_sines[i] = ratio;
         }
     }
-    printf("\n");//DEBUG
 }
 
 static int cleanup(){
@@ -472,9 +559,12 @@ static int cleanup(){
         fftw_free(window[i]);
         fftw_free(dft_window[i]);
         
-        free(freq_cutoffs[i]);
         fftw_free(dft_bin[i]);
     }
+    free(freq_cutoffs);
+    free(source_sines);
+    free(power_spectra);
+    free(pspec_mov_avg);
     fftw_destroy_plan(plancorre);
     fftw_free(dft_corre);
     fftw_cleanup();
@@ -488,14 +578,16 @@ int main(int argc, char **argv){
         PaStream *stream;
         PaError err;
         testdata data;
+        double time_increment;
         
         /** GLFW initialization **/
         GLFWwindow* window;
         glfwSetErrorCallback(error_callback);
         if (!glfwInit())
             exit(EXIT_FAILURE);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
         glfwWindowHint(GLFW_SAMPLES, 4);
-        window = glfwCreateWindow(640, 480, "Poi", NULL, NULL);
+        window = glfwCreateWindow(720, 720, "Poi", NULL, NULL);
         if (!window)
         {
             glfwTerminate();
@@ -537,16 +629,24 @@ int main(int argc, char **argv){
         **/
         
         ///** loop with GLFW window
+        time_increment = 0.8/FRAME_RATE; //guarantees at least 60 FPS updating
+        glfwSetTime(0.0);
         while (!glfwWindowShouldClose(window))
         {
-            //timing for synchronization
+            float ratio;
+            int width, height;
+            
+            /** timing statistics
             timeval before, after, elapsed;
             unsigned long usec_remaining;
             gettimeofday(&before, NULL);
+            **/
             
-            float ratio;
-            int width, height;
-            analyze_async();
+            if (glfwGetTime() >= time_increment){
+                glfwSetTime(0.0);
+                mov_avg_update();
+                analyze_async();
+            }
             glfwGetFramebufferSize(window, &width, &height);
             ratio = width / (float) height;
             glViewport(0, 0, width, height);
@@ -556,28 +656,39 @@ int main(int argc, char **argv){
             glOrtho(-ratio, ratio, -1.f, 1.f, 1.f, -1.f);
             glMatrixMode(GL_MODELVIEW);
             glLoadIdentity();
-            glRotatef((float) glfwGetTime() * 50.f, 0.f, 0.f, 1.f);
-            glBegin(GL_TRIANGLES);
-            glColor3f(1.f, 0.f, 0.f);
-            glVertex3f(-0.6f, -0.4f, 0.f);
-            glColor3f(0.f, 1.f, 0.f);
-            glVertex3f(0.6f, -0.4f, 0.f);
-            glColor3f(0.f, 0.f, 1.f);
-            glVertex3f(0.f, 0.6f, 0.f);
-            glEnd();
-            glfwSwapBuffers(window);
-            glfwPollEvents();
             
-            //timing for synchronization
+            //TODO: enable lighting, implement basic visualization (w/ shaders)
+            
+            //Test display of the calculated source locations
+            glBegin(GL_TRIANGLES);
+            for (int i = 0; i < num_bins; i++){
+                float index, offset, rising_edge, intensity;
+                index = i/((float)(num_cutoffs));
+                offset = (float)(source_sines[i]);
+                intensity = 1.f + (log10f((float)(power_spectra[i])) / (1.f - log10f((float)(power_spectra[i]))));
+                if (pspec_mov_avg[i] > 0.0){
+                    rising_edge = (float)((power_spectra[i] / (10.f * pspec_mov_avg[i])));
+                    rising_edge = (rising_edge > 1.f)? 1.f : rising_edge;
+                } else {
+                    rising_edge = 0.f;
+                }
+                glColor4f(0.f + index, 0.f, 1.f - index, intensity);
+                //glColor4f(0.f + index, 0.f, 1.f - index, rising_edge);
+                glVertex3f(-0.06f + offset, -0.04f, 0.f);
+                glVertex3f(0.06f + offset, -0.04f, 0.f);
+                glVertex3f(0.f + offset, 0.06f, 0.f);
+            }
+            glEnd();
+            
+            /**timing statistics
             gettimeofday(&after, NULL);
             tval_sub(after, before, &elapsed);
             usec_remaining = MILLION_INT/FRAME_RATE - tval_to_usec(elapsed);
-            if (usec_remaining > 0){
-                printf("leeway ~= %ld\n", usec_remaining);//DEBUG
-                usleep(usec_remaining);
-            } else {
-                printf("Warning: processing is taking too long\n.");
-            }
+            printf("leeway ~= %ld\n", usec_remaining);
+            **/
+            
+            glfwSwapBuffers(window);
+            glfwPollEvents();
         }
         //**/
         
@@ -596,3 +707,4 @@ int main(int argc, char **argv){
     }
     return 0;
 }
+

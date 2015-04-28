@@ -66,7 +66,7 @@
 #define HEAD_WIDTH 0.35
 
 //maximum interaural level difference, as a normalized ratio
-#define MAX_ILD 2
+#define MAX_ILD 1.6
 
 //flag: 1 for a hanning window, 0 for a rectangular window
 #define HANNING 1
@@ -664,19 +664,22 @@ int main(int argc, char **argv){
             for (int i = 0; i < num_bins; i++){
                 float index, offset, rising_edge, intensity;
                 index = i/((float)(num_cutoffs));
-                offset = (float)(source_sines[i]);
-                intensity = 1.f + (log10f((float)(power_spectra[i])) / (1.f - log10f((float)(power_spectra[i]))));
+                offset = (float)(source_sines[i] * ratio);
+                if (power_spectra[i] > 0.0){
+                    intensity = 1.f + (log10f((float)(power_spectra[i])) / (1.f - log10f((float)(power_spectra[i]))));
+                } else {
+                    intensity = 0.f;
+                }
                 if (pspec_mov_avg[i] > 0.0){
-                    rising_edge = (float)((power_spectra[i] / (10.f * pspec_mov_avg[i])));
-                    rising_edge = (rising_edge > 1.f)? 1.f : rising_edge;
+                    rising_edge = (float)((power_spectra[i] / (1.25f * pspec_mov_avg[i])) * intensity);
+                    rising_edge = (rising_edge > 1.f)? 1.f : ((rising_edge < 0.f)? 0.f : rising_edge);
                 } else {
                     rising_edge = 0.f;
                 }
-                glColor4f(0.f + index, 0.f, 1.f - index, intensity);
-                //glColor4f(0.f + index, 0.f, 1.f - index, rising_edge);
-                glVertex3f(-0.06f + offset, -0.04f, 0.f);
-                glVertex3f(0.06f + offset, -0.04f, 0.f);
-                glVertex3f(0.f + offset, 0.06f, 0.f);
+                glColor4f(0.f + index, 0.f, 1.f - index, rising_edge);
+                glVertex3f(-0.06f + offset, -1.f, 0.f);
+                glVertex3f(0.06f + offset, -1.f, 0.f);
+                glVertex3f(0.f + offset, 3.f * intensity - 1.f, 0.f);
             }
             glEnd();
             

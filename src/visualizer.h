@@ -23,6 +23,8 @@ extern "C" {
 
 #define FRAME_RATE 60
 
+#define WALL_RES 64
+
 //speed of sound, in meters per second
 #define SOUND_SPEED 343.59
 

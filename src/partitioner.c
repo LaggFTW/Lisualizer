@@ -1,3 +1,7 @@
+/**
+Functions related to the partitioning of the waveform into different sounds
+**/
+
 #include "partitioner.h"
 
 void calc_cutoffs_2ch(fftw_complex *data[2], int *cutoffs, int start, int end, int cut_ind, int num_cutoffs){
@@ -27,4 +31,6 @@ void calc_cutoffs_2ch(fftw_complex *data[2], int *cutoffs, int start, int end, i
         calc_cutoffs_2ch(data, cutoffs, cut, end, cut_after, num_cutoffs);
     }
 }
+
+/** (more methods likely to be added) **/
 

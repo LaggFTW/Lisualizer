@@ -46,6 +46,28 @@
 
 typedef struct timeval timeval;
 
+//typedef struct light_params { } light_params; //to be implemented and used with shader structs
+
+/**
+Additional visualizer data
+**/
+static GLenum lights[4][2] = {{GL_LIGHT0, GL_LIGHT4}, {GL_LIGHT1, GL_LIGHT5},
+        {GL_LIGHT2, GL_LIGHT6}, {GL_LIGHT3, GL_LIGHT7}}; //lights representing each bin, hardcoded for now
+//uniform_light_params **lights; //non-hardcoded alternative, will be used with uniform shader variables
+static float *source_offsets; //store current offsets
+static float max_offset_velocity; //cap on how far a visualization object can move per frame
+
+//background wall parameters
+static int wall_resolution; //determines # of triangles to draw inside the wall
+static float ambi[4] = {0.15f, 0.15f, 0.15f, 1.f}; //ambient light material properties
+static float diff[4] = {0.8f, 0.8f, 0.8f, 1.f}; //diffuse light material properties
+static float spec[4] = {0.05f, 0.05f, 0.05f, 1.f}; //specular light material properties
+
+//colors for each bin
+static float bin_color[4][3] = {{0.4f, 0.f, 0.8f}, {0.f, 0.f, 1.f},
+        {0.1f, .9f, 0.1f}, {0.9f, 0.3f, 0.f}};
+/**/
+
 /**
 GLFW callbacks
 **/
@@ -58,6 +80,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GL_TRUE);
 }
+/**/
 
 /*
  * Returns: the timeval's toal value represented in microseconds.
@@ -117,6 +140,7 @@ static void mov_avg_update(VisualizerData *data){
     }
 }
 
+//initialize values for waveform processing and audio playback/recording
 static int init(const char *fname, VisualizerData *data){
     SF_INFO fileinfo;
 
@@ -185,7 +209,7 @@ static int init(const char *fname, VisualizerData *data){
 }
 
 /**
-Sliding Window Analysis, no synchronization
+Sliding Window Analysis
 **/
 static void analyze_async(VisualizerData *data){
     /**
@@ -336,6 +360,7 @@ static void analyze_async(VisualizerData *data){
     }
 }
 
+//clean up space that was used for waveform processing and audio playback/recording
 static int cleanup(VisualizerData *data){
     for (int i = 0; i < 2; i++){
         fftw_destroy_plan(data->plan[i]);
@@ -356,44 +381,202 @@ static int cleanup(VisualizerData *data){
     }
 }
 
+//initialize GLFW and additional visualization data
+void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
+    GLFWwindow *window;
+    /** GLFW initialization **/
+    glfwSetErrorCallback(error_callback);
+    if (!glfwInit())
+        exit(EXIT_FAILURE);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+    *window_ptr = glfwCreateWindow(720, 720, "Poi", NULL, NULL);
+    window = *window_ptr;
+    if (!window)
+    {
+        glfwTerminate();
+        exit(EXIT_FAILURE);
+    }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    glfwSetKeyCallback(window, key_callback);
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK)
+        exit(EXIT_FAILURE);
+    glEnable(GL_FRAMEBUFFER_SRGB_EXT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glShadeModel(GL_SMOOTH);
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_LIGHTING);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_NORMALIZE);
+    /** **/
+    
+    /** Initialize additional visualization parameters **/
+    source_offsets = (float *)(ucalloc(data->num_bins, sizeof(float)));
+    max_offset_velocity = 0.05f;
+    wall_resolution = WALL_RES;
+    for (int i = 0; i < data->num_bins; i++){
+        //initialize positions to be in the center
+        source_offsets[i] = 0.f;
+    }
+    /** **/
+    
+    //hard code: enable all lights, but set them all to be dimmed
+    {
+        float zeros[4] = {0.f, 0.f, 0.f, 1.f};
+        for (int i = 0; i < 4; i++){
+            for (int j = 0; j < 2; j++){
+                glEnable(lights[i][j]);
+                glLightfv(lights[i][j], GL_POSITION, zeros);
+				glLightfv(lights[i][j], GL_AMBIENT, zeros);
+				glLightfv(lights[i][j], GL_DIFFUSE, zeros);
+				glLightfv(lights[i][j], GL_SPECULAR, zeros);
+				glLightfv(lights[i][j], GL_EMISSION, zeros);
+            }
+        }
+    }
+}
+
+//updates the locations, and intensity of the lights
+void visualizer_update(VisualizerData *data, float width){
+    float location[4] = {0.f, 0.f, 0.f, 1.f};
+    float light_intensity[4] = {0.f, 0.f, 0.f, 1.f};
+    float source_increment;
+    float intensity;
+    float rising_edge;
+    
+    for (int i = 0; i < data->num_bins; i++){
+        //update location of lights
+        source_increment = data->source_sines[i] - source_offsets[i];
+        if (source_increment > max_offset_velocity){
+            source_increment = max_offset_velocity;
+        } else {
+            if (source_increment < -max_offset_velocity){
+                source_increment = -max_offset_velocity;
+            }
+        }
+        source_offsets[i] += source_increment;
+        if (i < 4){
+            location[0] = source_offsets[i] * width;
+            glLightfv(lights[i][0], GL_POSITION, location);
+            glLightfv(lights[i][1], GL_POSITION, location);
+        }
+        
+        //update intensity of lights
+        if (data->power_spectra[i] > 0.0){
+            intensity = 1.f + (log10f((float)(data->power_spectra[i])) / (1.f - log10f((float)(data->power_spectra[i]))));
+            rising_edge = (float)(((data->power_spectra[i] - data->pspec_mov_avg[i]) / data->power_spectra[i]) * intensity);
+            if (rising_edge < 0.f){
+                rising_edge = 0.f;
+            }
+        } else {
+            intensity = 0.f;
+            rising_edge = 0.f;
+        }
+        /**
+        if (data->pspec_mov_avg[i] > 0.0){
+            rising_edge = (float)((data->power_spectra[i] / (10.f * data->pspec_mov_avg[i])) * intensity);
+            rising_edge = (rising_edge > 1.f)? 1.f : ((rising_edge < 0.f)? 0.f : rising_edge);
+        } else {
+            rising_edge = 0.f;
+        }
+        **/
+        if (i < 4){
+            for (int j = 0; j < 3; j++){
+                light_intensity[j] = bin_color[i][j] * intensity;
+            }
+            glLightfv(lights[i][0], GL_DIFFUSE, light_intensity);
+			glLightfv(lights[i][0], GL_SPECULAR, light_intensity);
+			glLightfv(lights[i][0], GL_EMISSION, light_intensity);
+			for (int j = 0; j < 3; j++){
+		        light_intensity[j] = bin_color[i][j] * rising_edge;
+			}
+            glLightfv(lights[i][1], GL_DIFFUSE, light_intensity);
+			glLightfv(lights[i][1], GL_SPECULAR, light_intensity);
+			glLightfv(lights[i][1], GL_EMISSION, light_intensity);
+        }
+    }
+}
+
+//render the graphics related to the visualization
+void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_ratio){
+    float ratio, wall_incr_x, wall_incr_y;
+    int width, height;
+
+    glfwGetFramebufferSize(window, &width, &height);
+    ratio = width / (float) height;
+    glViewport(0, 0, width, height);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-ratio, ratio, -1.f, 1.f, 1.f, -1.f);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    
+    *aspect_ratio = ratio;
+    
+    //draw background pane, slightly behind the lights
+    {
+        float wall_x, wall_y, wall_x_next, wall_y_next;
+        wall_incr_x = 2.f * ratio / wall_resolution;
+        wall_incr_y = 2.f / wall_resolution;
+        glBegin(GL_TRIANGLES);
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, ambi);
+		glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, diff);
+		glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec);
+		glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 0.15f);
+		glNormal3f(0.f, 0.f, -1.f);
+        wall_y = -1.f;
+        for (int i = 0; i < wall_resolution; i++){
+            wall_x = -ratio;
+            wall_y_next = wall_y + wall_incr_y;
+            for (int j = 0; j < wall_resolution; j++){
+                wall_x_next = wall_x + wall_incr_x;
+                glVertex3f(wall_x, wall_y, .1f);
+                glVertex3f(wall_x, wall_y_next, .1f);
+                glVertex3f(wall_x_next, wall_y, .1f);
+                glVertex3f(wall_x_next, wall_y, .1f);
+                glVertex3f(wall_x_next, wall_y_next, .1f);
+                glVertex3f(wall_x, wall_y_next, .1f);
+                wall_x = wall_x_next;
+            }
+            wall_y = wall_y_next;
+        }
+        glEnd();
+    }
+    
+    //draw lights on the xy-plane (z=0)
+    //TODO
+}
+
+//clean up and exit the visualization
+void visualizer_end(GLFWwindow *window){
+    free(source_offsets);
+    /** close GLFW window **/
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    exit(EXIT_SUCCESS);
+    /** **/
+}
+
 int visualizer_start(int argc, char **argv){
     if (argc >= 2){
         PaStream *stream;
         PaError err;
+        GLFWwindow* window;
         VisualizerData data;
         double time_increment;
-        
-        /** GLFW initialization **/
-        GLFWwindow* window;
-        glfwSetErrorCallback(error_callback);
-        if (!glfwInit())
-            exit(EXIT_FAILURE);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-        glfwWindowHint(GLFW_SAMPLES, 4);
-        window = glfwCreateWindow(720, 720, "Poi", NULL, NULL);
-        if (!window)
-        {
-            glfwTerminate();
-            exit(EXIT_FAILURE);
-        }
-        glfwMakeContextCurrent(window);
-        glfwSwapInterval(1);
-        glfwSetKeyCallback(window, key_callback);
-        glewExperimental = GL_TRUE;
-        if (glewInit() != GLEW_OK)
-            exit(EXIT_FAILURE);
-        glEnable(GL_FRAMEBUFFER_SRGB_EXT);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glShadeModel(GL_SMOOTH);
-        glEnable(GL_MULTISAMPLE);
-        /** **/
+        float ratio;
         
         err = Pa_Initialize(); //initialize portaudio
         if(err != paNoError){
             return 0;
         }
         init(argv[1], &data); //initialize parameters for playback + waveform processing
+        visualizer_init(&window, &data); //initialize visualization window + variables
         //open default stereo output stream
         err = Pa_OpenDefaultStream(&stream, 0, 2, paFloat32, data.samplerate, paFramesPerBufferUnspecified, pa_callback, &data);
         if (err != paNoError){
@@ -405,17 +588,15 @@ int visualizer_start(int argc, char **argv){
             return 0;
         }
         
-        ///** loop with GLFW window
+        /** loop with GLFW window **/
+        ratio = 0.f;
         time_increment = 0.8/FRAME_RATE; //guarantees at least 60 FPS updating
         glfwSetTime(0.0);
         while (!glfwWindowShouldClose(window))
         {
-            float ratio;
-            int width, height;
-            
             /** timing statistics
             timeval before, after, elapsed;
-            unsigned long usec_remaining;
+            long usec_remaining;
             gettimeofday(&before, NULL);
             **/
             
@@ -424,53 +605,20 @@ int visualizer_start(int argc, char **argv){
                 mov_avg_update(&data);
                 analyze_async(&data);
             }
-            glfwGetFramebufferSize(window, &width, &height);
-            ratio = width / (float) height;
-            glViewport(0, 0, width, height);
-            glClear(GL_COLOR_BUFFER_BIT);
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
-            glOrtho(-ratio, ratio, -1.f, 1.f, 1.f, -1.f);
-            glMatrixMode(GL_MODELVIEW);
-            glLoadIdentity();
+            visualizer_render(window, &data, &ratio);
             
-            //TODO: enable lighting, implement basic visualization (w/ shaders)
-            
-            //Test display of the calculated source locations
-            glBegin(GL_TRIANGLES);
-            for (int i = 0; i < data.num_bins; i++){
-                float index, offset, rising_edge, intensity;
-                index = i/((float)(data.num_cutoffs));
-                offset = (float)(data.source_sines[i] * ratio);
-                if (data.power_spectra[i] > 0.0){
-                    intensity = 1.f + (log10f((float)(data.power_spectra[i])) / (1.f - log10f((float)(data.power_spectra[i]))));
-                } else {
-                    intensity = 0.f;
-                }
-                if (data.pspec_mov_avg[i] > 0.0){
-                    rising_edge = (float)((data.power_spectra[i] / (1.25f * data.pspec_mov_avg[i])) * intensity);
-                    rising_edge = (rising_edge > 1.f)? 1.f : rising_edge;
-                } else {
-                    rising_edge = 0.f;
-                }
-                glColor4f(0.f + index, 0.f, 1.f - index, rising_edge);
-                glVertex3f(-0.06f + offset, -1.f, 0.f);
-                glVertex3f(0.06f + offset, -1.f, 0.f);
-                glVertex3f(0.f + offset, 3.f * intensity - 1.f, 0.f);
-            }
-            glEnd();
+            visualizer_update(&data, ratio);
             
             /**timing statistics
             gettimeofday(&after, NULL);
             tval_sub(after, before, &elapsed);
             usec_remaining = MILLION_INT/FRAME_RATE - tval_to_usec(elapsed);
-            printf("leeway ~= %ld\n", usec_remaining);
+            if (usec_remaining < 0) { printf("leeway ~= %ld\n", usec_remaining); }
             **/
             
             glfwSwapBuffers(window);
             glfwPollEvents();
         }
-        //**/
         
         //sleep(1); //Pa_Sleep(1*1000);
         err = Pa_StopStream(stream);
@@ -478,12 +626,7 @@ int visualizer_start(int argc, char **argv){
             return 0;
         }
         cleanup(&data);
-        
-        /** close GLFW window **/
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        exit(EXIT_SUCCESS);
-        /** **/
+        visualizer_end(window);
     }
     return 0;
 }

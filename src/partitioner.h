@@ -2,6 +2,7 @@
 #define PARTITIONER_H
 
 #include <fftw3.h>
+#include "sep_proc_data.h"
 
 #ifdef __cplusplus
 extern "C" {

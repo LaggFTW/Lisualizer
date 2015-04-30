@@ -130,7 +130,7 @@ static int pa_callback(const void *inputBuffer, void *outputBuffer,
     }
     for (int i = 0; i < framesPerBuffer; i++){
         if ((PaUtil_GetRingBufferWriteAvailable(&io_buffer) >= 2) 
-                && (PaUtil_GetRingBufferWriteAvailable(&io_buffer) >= 2)){
+                && (PaUtil_GetRingBufferWriteAvailable(&sample_buffer) >= 2)){
             if (inputfile.read(smp, 2) < 2){
                 //for processing purposes, if we encounter EOF, treat it as silence
                 smp[0] = 0.0f; smp[1] = 0.0f;

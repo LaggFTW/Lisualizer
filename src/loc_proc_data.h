@@ -22,7 +22,8 @@ typedef struct {
     fftw_plan plan[2];
     int window_size;
     int transform_size;
-    int cutoff; //index of dft coefficient corresponding to the cutoff determining whether to use ITD or ILD
+    int itd_cutoff; //index of highest frequency to attempt ITD on
+    int ild_cutoff; //index of lowest frequency to attempt ILD on
 } localizer_data;
 
 #ifdef __cplusplus

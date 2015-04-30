@@ -21,9 +21,15 @@ extern "C" {
 
 #define MOV_AVG_WINDOW_SIZE 4096
 
-#define FRAME_RATE 60
+#define DEFAULT_SAMPLE_RATE 44100
 
-#define WALL_RES 64
+#define FRAME_RATE 60
+//#define FRAME_RATE 30
+
+#define WALL_RES 64 //suggested with 60 FPS rendering
+//#define WALL_RES 128 //suggested with 30 FPS rendering
+
+#define VIS_BRIGHT //for a brighter but possibly more epileptic/eye-straining visualization
 
 //speed of sound, in meters per second
 #define SOUND_SPEED 343.59
@@ -33,6 +39,10 @@ extern "C" {
 
 //maximum interaural level difference, as a normalized ratio
 #define MAX_ILD 1.6
+
+//frequencies for determining how to localize a waveform
+#define ITD_CUTOFF_FREQ 1500
+#define ILD_CUTOFF_FREQ 1000
 
 //flag: 1 for a hanning window, 0 for a rectangular window
 #define HANNING 1
@@ -53,7 +63,8 @@ typedef struct {
     fftw_plan plancorre;
     float samples[WINDOW_SIZE*2];
     int transform_size;
-    int cutoff_1600; //index of dft coefficient corresponding to 1600 Hz
+    int itd_cutoff; //index of highest frequency to attempt ITD on
+    int ild_cutoff; //index of lowest frequency to attempt ILD on
 
     //separation cutoff data
     fftw_complex *dft_bin[2];

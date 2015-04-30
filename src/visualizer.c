@@ -59,13 +59,24 @@ static float max_offset_velocity; //cap on how far a visualization object can mo
 
 //background wall parameters
 static int wall_resolution; //determines # of triangles to draw inside the wall
-static float ambi[4] = {0.15f, 0.15f, 0.15f, 1.f}; //ambient light material properties
+#ifdef VIS_BRIGHT
+static float ambi[4] = {0.05f, 0.05f, 0.05f, 1.f}; //ambient light material properties
 static float diff[4] = {0.8f, 0.8f, 0.8f, 1.f}; //diffuse light material properties
-static float spec[4] = {0.05f, 0.05f, 0.05f, 1.f}; //specular light material properties
+static float spec[4] = {0.95f, 0.95f, 0.95f, 1.f}; //specular light material properties
+#else
+static float ambi[4] = {0.05f, 0.05f, 0.05f, 1.f}; //ambient light material properties
+static float diff[4] = {0.45f, 0.45f, 0.45f, 1.f}; //diffuse light material properties
+static float spec[4] = {0.5f, 0.5f, 0.5f, 1.f}; //specular light material properties
+#endif
+
 
 //colors for each bin
 static float bin_color[4][3] = {{0.4f, 0.f, 0.8f}, {0.f, 0.f, 1.f},
         {0.1f, .9f, 0.1f}, {0.9f, 0.3f, 0.f}};
+
+//other constants
+static const float ones[4] = {1.f, 1.f, 1.f, 1.f};
+static const float zeros[4] = {0.f, 0.f, 0.f, 1.f};
 /**/
 
 /**
@@ -103,6 +114,10 @@ static void tval_sub(const timeval end, const timeval start, timeval *elapsed){
     }
 }
 
+/**
+Callback method for PortAudio that reads in audio from a file, and writes it to
+two ringbuffers: one for playback, and one for audio analysis
+**/
 static int pa_callback(const void *inputBuffer, void *outputBuffer, 
         unsigned long framesPerBuffer, const PaStreamCallbackTimeInfo* timeInfo,
         PaStreamCallbackFlags statusFlags, void *userData){
@@ -119,7 +134,7 @@ static int pa_callback(const void *inputBuffer, void *outputBuffer,
     }
     for (int i = 0; i < framesPerBuffer; i++){
         if ((PaUtil_GetRingBufferWriteAvailable(&(data->io_buffer)) >= 2) 
-                && (PaUtil_GetRingBufferWriteAvailable(&(data->io_buffer)) >= 2)){
+                && (PaUtil_GetRingBufferWriteAvailable(&(data->sample_buffer)) >= 2)){
             if (sf_read_float(data->inputfile, smp, 2) < 2){
                 //for processing purposes, if we encounter EOF, treat it as silence
                 smp[0] = 0.0f; smp[1] = 0.0f;
@@ -127,6 +142,26 @@ static int pa_callback(const void *inputBuffer, void *outputBuffer,
                 continue;
             }
             PaUtil_WriteRingBuffer(&(data->io_buffer), smp, 2);
+            PaUtil_WriteRingBuffer(&(data->sample_buffer), smp, 2);
+        }
+    }
+    return paContinue;
+}
+
+/**
+Callback method for PortAudio that reads in audio from an input stream,
+and writes it to a ringbuffer for audio analysis
+**/
+static int pa_input_callback(const void *inputBuffer, void *outputBuffer, 
+        unsigned long framesPerBuffer, const PaStreamCallbackTimeInfo* timeInfo,
+        PaStreamCallbackFlags statusFlags, void *userData){
+    VisualizerData *data = (VisualizerData *)userData;
+    float *in = (float *)inputBuffer;
+    float *out = (float *)outputBuffer;
+    float smp[2];
+    for (int i = 0; i < framesPerBuffer; i+=2){
+        if (PaUtil_GetRingBufferWriteAvailable(&(data->sample_buffer)) >= 2){
+            smp[0] = in[i]; smp[1] = in[i+1];
             PaUtil_WriteRingBuffer(&(data->sample_buffer), smp, 2);
         }
     }
@@ -142,8 +177,6 @@ static void mov_avg_update(VisualizerData *data){
 
 //initialize values for waveform processing and audio playback/recording
 static int init(const char *fname, VisualizerData *data){
-    SF_INFO fileinfo;
-
     //information for separation
     data->num_bins = 4;
     data->num_cutoffs = data->num_bins - 1;
@@ -157,15 +190,21 @@ static int init(const char *fname, VisualizerData *data){
     /**
     Intial opening of file
     **/
-    data->inputfile = sf_open(fname, SFM_READ, &fileinfo);
-    if (!data->inputfile){
-        printf("sndfile: file reading error\n");
-        return ERRCODE_FAILURE;
+    if (fname){
+        SF_INFO fileinfo;
+        data->inputfile = sf_open(fname, SFM_READ, &fileinfo);
+        if (!data->inputfile){
+            printf("sndfile: file reading error\n");
+            return ERRCODE_FAILURE;
+        }
+        if (fileinfo.channels != 2){
+            return ERRCODE_UNSUPPORTED;
+        }
+        data->samplerate = fileinfo.samplerate;
+    } else {
+        data->inputfile = NULL;
+        data->samplerate = DEFAULT_SAMPLE_RATE;
     }
-    if (fileinfo.channels != 2){
-        return ERRCODE_UNSUPPORTED;
-    }
-    data->samplerate = fileinfo.samplerate;
     for (int i = 0; i < WINDOW_SIZE; i+=2){ //zero-initialize sample arrays and buffers
         data->io_buf_arr[i] = 0.0f;
         data->smp_buf_arr[i] = 0.0f;
@@ -194,7 +233,8 @@ static int init(const char *fname, VisualizerData *data){
     Sliding Window Initialization
     **/
     data->transform_size = WINDOW_SIZE/2 + 1;
-    data->cutoff_1600 = (int)((3200.0/data->samplerate) * (WINDOW_SIZE/2)); //cutoff = 1600 / nyquist freq * max transform index
+    data->itd_cutoff = (int)((2.0*ITD_CUTOFF_FREQ/data->samplerate) * (WINDOW_SIZE/2)); //cutoff = freq / nyquist freq * max transform index
+    data->ild_cutoff = (int)((2.0*ILD_CUTOFF_FREQ/data->samplerate) * (WINDOW_SIZE/2)); //cutoff = freq / nyquist freq * max transform index
     data->window_increment = data->samplerate / FRAME_RATE * 2; //for static window shift, if needed
     for (int i = 0; i < 2; i++){
         data->window[i] = (double *)(fftw_malloc(sizeof(double)*WINDOW_SIZE));
@@ -255,7 +295,8 @@ static void analyze_async(VisualizerData *data){
     calc_cutoffs_2ch(data->dft_window, data->freq_cutoffs, 0, data->transform_size, data->num_cutoffs/2, data->num_bins/2);
     for (i = 0; i < data->num_bins; i++){
         double diff, intensity; //values to be used for ILD
-        int loc_method = 0; //determines whether to use ITD or ILD
+        int itd = 0, ild = 0; //flags for determining use of ILD and ITD
+        data->source_sines[i] = 0.0; //reset the angle
         data->power_spectra[i] = 0.0; //reset the current power spectrum values
         for (int k = 0; k < 2; k++){
             for (int j = 0; j < data->transform_size; j++){
@@ -267,26 +308,23 @@ static void analyze_async(VisualizerData *data){
                 }
             }
         }
-        if (i > 0){
-            if (data->freq_cutoffs[i-1] >= data->cutoff_1600){
-                loc_method = 1;
-                diff = 0.0;
-                intensity = 0.0;
-            } else {
-                if (i < data->num_cutoffs && (data->freq_cutoffs[i-1] + data->freq_cutoffs[i]) >= (data->cutoff_1600 * 2)){
-                    loc_method = 1;
-                    diff = 0.0;
-                    intensity = 0.0;
-                }
-            }
+        if (i == 0 || data->freq_cutoffs[i-1] < data->itd_cutoff){
+            //if this bin's lower bound frequency is less than that of the maximum ITD cutoff, enable ITD
+            itd = 1;
+        }
+        if (i == data->num_cutoffs || data->freq_cutoffs[i] > data->ild_cutoff){
+            //if this bin's upper bound frequency is greater than that of the minimum ILD cutoff, enable ILD
+            ild = 1;
+            diff = 0.0;
+            intensity = 0.0;
         }
         /**
         This loop does two things
         1. Computes peak power of this bin
         2. Uses a sound localization method to find a source angle (done in two ways):
-        Audio below ~1600 Hz: take cross-correlation of the left and right using the DFTs already computed, compute a source angle
+        Audio below ~1500 Hz: take cross-correlation of the left and right using the DFTs already computed, compute a source angle
             negative angle: to the left, positive angle: to the right
-        Audio above ~1600 Hz: checks interaural level difference between left and right bins
+        Audio above ~1000 Hz: checks interaural level difference between left and right bins
         **/
         window_sq = WINDOW_SIZE * WINDOW_SIZE;
         for (int j = 0; j < data->transform_size; j++){
@@ -300,29 +338,33 @@ static void analyze_async(VisualizerData *data){
                 data->power_spectra[i] = norm_a;
             }
             //prepare for sound localization
-            if (loc_method){
-                //audio above ~1600 Hz: use ILD
+            if (ild){
+                //audio above ~1000 Hz: use ILD
                 diff += norm_r - norm_l;
                 intensity += norm_a;
-            } else {
-                //audio below ~1600 Hz: use ITD, prepare for cross-correlation
+            }
+            if (itd) {
+                //audio below ~1500 Hz: use ITD, prepare for cross-correlation
                 data->dft_corre[j][0] = (dft_bin[0][j][0] * dft_bin[1][j][0] + dft_bin[0][j][1] * dft_bin[1][j][1])/window_sq;
                 data->dft_corre[j][1] = (dft_bin[0][j][0] * dft_bin[1][j][1] - dft_bin[0][j][1] * dft_bin[1][j][0])/window_sq;
             }
         }
-        if (loc_method){
+        if (ild){
             //ILD
             double ratio;
             diff = (intensity > 0.0)? diff/intensity : 0.0;
             ratio = diff / MAX_ILD;
             if (ratio > 1.0){
                 ratio = 1.0;
+                itd = 0; //we are looking for the method that yields the largest angle, no need to check ITD since ILD angle is maximized
             }
             if (ratio < -1.0){
                 ratio = -1.0;
+                itd = 0; //we are looking for the method that yields the largest angle, no need to check ITD since ILD angle is maximized
             }
             data->source_sines[i] = ratio;
-        } else {
+        }
+        if (itd) {
             //ITD w/ cross-correlation
             long max_index = 0;
             long max_delay, delay_value;
@@ -355,7 +397,9 @@ static void analyze_async(VisualizerData *data){
                 ratio = -1.0;
             }
             //angle = asin(ratio); //we don't actually need the angle for rendering
-            data->source_sines[i] = ratio;
+            if (ratio * ratio > data->source_sines[i] * data->source_sines[i]){
+                data->source_sines[i] = ratio;
+            }
         }
     }
 }
@@ -376,13 +420,15 @@ static int cleanup(VisualizerData *data){
     fftw_destroy_plan(data->plancorre);
     fftw_free(data->dft_corre);
     fftw_cleanup();
-    if (sf_close(data->inputfile)){
-        printf("sndfile: error closing file\n");
+    if (data->inputfile){
+        if (sf_close(data->inputfile)){
+            printf("sndfile: error closing file\n");
+        }
     }
 }
 
 //initialize GLFW and additional visualization data
-void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
+static void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
     GLFWwindow *window;
     /** GLFW initialization **/
     glfwSetErrorCallback(error_callback);
@@ -398,7 +444,8 @@ void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
         exit(EXIT_FAILURE);
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
+    glfwSwapInterval(1); //60 FPS
+    //glfwSwapInterval(2); //30 FPS
     glfwSetKeyCallback(window, key_callback);
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK)
@@ -415,7 +462,8 @@ void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
     
     /** Initialize additional visualization parameters **/
     source_offsets = (float *)(ucalloc(data->num_bins, sizeof(float)));
-    max_offset_velocity = 0.05f;
+    max_offset_velocity = 0.03f; //slow
+    //max_offset_velocity = 0.05f; //fast
     wall_resolution = WALL_RES;
     for (int i = 0; i < data->num_bins; i++){
         //initialize positions to be in the center
@@ -425,7 +473,7 @@ void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
     
     //hard code: enable all lights, but set them all to be dimmed
     {
-        float zeros[4] = {0.f, 0.f, 0.f, 1.f};
+        //float zeros[4] = {0.f, 0.f, 0.f, 1.f}; //don't need this since we have it as a global constant
         for (int i = 0; i < 4; i++){
             for (int j = 0; j < 2; j++){
                 glEnable(lights[i][j]);
@@ -439,10 +487,12 @@ void visualizer_init(GLFWwindow** window_ptr, VisualizerData *data){
     }
 }
 
-//updates the locations, and intensity of the lights
-void visualizer_update(VisualizerData *data, float width){
-    float location[4] = {0.f, 0.f, 0.f, 1.f};
+//updates the locations and intensities of the lights
+static void visualizer_update(VisualizerData *data, float width){
+    float location_near[4] = {0.f, 0.f, 0.09f, 1.f};
+    float location_far[4] = {0.f, 0.f, 0.04f, 1.f};
     float light_intensity[4] = {0.f, 0.f, 0.f, 1.f};
+    float light_intensity_white[4] = {0.f, 0.f, 0.f, 1.f};
     float source_increment;
     float intensity;
     float rising_edge;
@@ -459,9 +509,10 @@ void visualizer_update(VisualizerData *data, float width){
         }
         source_offsets[i] += source_increment;
         if (i < 4){
-            location[0] = source_offsets[i] * width;
-            glLightfv(lights[i][0], GL_POSITION, location);
-            glLightfv(lights[i][1], GL_POSITION, location);
+            location_far[0] = source_offsets[i] * width;
+            location_near[0] = location_far[0];
+            glLightfv(lights[i][0], GL_POSITION, location_near);
+            glLightfv(lights[i][1], GL_POSITION, location_far);
         }
         
         //update intensity of lights
@@ -485,14 +536,18 @@ void visualizer_update(VisualizerData *data, float width){
         **/
         if (i < 4){
             for (int j = 0; j < 3; j++){
-                light_intensity[j] = bin_color[i][j] * intensity;
+                light_intensity[j] = bin_color[i][j] * (intensity + rising_edge);
+                light_intensity_white[j] = ones[j] * (intensity + rising_edge);
             }
             glLightfv(lights[i][0], GL_DIFFUSE, light_intensity);
 			glLightfv(lights[i][0], GL_SPECULAR, light_intensity);
 			glLightfv(lights[i][0], GL_EMISSION, light_intensity);
+			/**
 			for (int j = 0; j < 3; j++){
-		        light_intensity[j] = bin_color[i][j] * rising_edge;
+		        light_intensity[j] += bin_color[i][j] * rising_edge;
+                light_intensity_white[j] += ones[j] * rising_edge;
 			}
+			**/
             glLightfv(lights[i][1], GL_DIFFUSE, light_intensity);
 			glLightfv(lights[i][1], GL_SPECULAR, light_intensity);
 			glLightfv(lights[i][1], GL_EMISSION, light_intensity);
@@ -501,7 +556,7 @@ void visualizer_update(VisualizerData *data, float width){
 }
 
 //render the graphics related to the visualization
-void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_ratio){
+static void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_ratio){
     float ratio, wall_incr_x, wall_incr_y;
     int width, height;
 
@@ -517,7 +572,7 @@ void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_r
     
     *aspect_ratio = ratio;
     
-    //draw background pane, slightly behind the lights
+    //draw background pane, slightly behind the lights (z=0.1)
     {
         float wall_x, wall_y, wall_x_next, wall_y_next;
         wall_incr_x = 2.f * ratio / wall_resolution;
@@ -527,7 +582,7 @@ void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_r
         glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, ambi);
 		glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, diff);
 		glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec);
-		glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 0.15f);
+		glMateriali(GL_FRONT_AND_BACK, GL_SHININESS, 16);
 		glNormal3f(0.f, 0.f, -1.f);
         wall_y = -1.f;
         for (int i = 0; i < wall_resolution; i++){
@@ -535,25 +590,22 @@ void visualizer_render(GLFWwindow *window, VisualizerData *data, float *aspect_r
             wall_y_next = wall_y + wall_incr_y;
             for (int j = 0; j < wall_resolution; j++){
                 wall_x_next = wall_x + wall_incr_x;
-                glVertex3f(wall_x, wall_y, .1f);
-                glVertex3f(wall_x, wall_y_next, .1f);
-                glVertex3f(wall_x_next, wall_y, .1f);
-                glVertex3f(wall_x_next, wall_y, .1f);
-                glVertex3f(wall_x_next, wall_y_next, .1f);
-                glVertex3f(wall_x, wall_y_next, .1f);
+                glVertex3f(wall_x, wall_y, 0.1f);
+                glVertex3f(wall_x, wall_y_next, 0.1f);
+                glVertex3f(wall_x_next, wall_y, 0.1f);
+                glVertex3f(wall_x_next, wall_y, 0.1f);
+                glVertex3f(wall_x_next, wall_y_next, 0.1f);
+                glVertex3f(wall_x, wall_y_next, 0.1f);
                 wall_x = wall_x_next;
             }
             wall_y = wall_y_next;
         }
         glEnd();
     }
-    
-    //draw lights on the xy-plane (z=0)
-    //TODO
 }
 
 //clean up and exit the visualization
-void visualizer_end(GLFWwindow *window){
+static void visualizer_end(GLFWwindow *window){
     free(source_offsets);
     /** close GLFW window **/
     glfwDestroyWindow(window);
@@ -563,25 +615,43 @@ void visualizer_end(GLFWwindow *window){
 }
 
 int visualizer_start(int argc, char **argv){
-    if (argc >= 2){
+    if (argc >= 1){
         PaStream *stream;
         PaError err;
         GLFWwindow* window;
         VisualizerData data;
         double time_increment;
         float ratio;
+        int read_file;
+        
+        read_file = (argc >= 2 && strcmp(argv[1], "-"))? 1 : 0;
         
         err = Pa_Initialize(); //initialize portaudio
         if(err != paNoError){
             return 0;
         }
-        init(argv[1], &data); //initialize parameters for playback + waveform processing
-        visualizer_init(&window, &data); //initialize visualization window + variables
-        //open default stereo output stream
-        err = Pa_OpenDefaultStream(&stream, 0, 2, paFloat32, data.samplerate, paFramesPerBufferUnspecified, pa_callback, &data);
-        if (err != paNoError){
-            return 0;
+        if (read_file){
+            //try to read in a file
+            init(argv[1], &data); //initialize parameters for playback + waveform processing
+            
+            //open default stereo output stream
+            err = Pa_OpenDefaultStream(&stream, 0, 2, paFloat32, data.samplerate, paFramesPerBufferUnspecified, pa_callback, &data);
+            if (err != paNoError){
+                return 0;
+            }
+        } else {
+            //take the default audio input stream as the parameter
+            init(NULL, &data); //initialize parameters for playback + waveform processing
+            
+            //open default stereo input stream
+            err = Pa_OpenDefaultStream(&stream, 2, 0, paFloat32, DEFAULT_SAMPLE_RATE, paFramesPerBufferUnspecified, pa_input_callback, &data);
+            if (err != paNoError){
+                return 0;
+            }
         }
+        
+        visualizer_init(&window, &data); //initialize visualization window + variables
+        
         //start stream
         err = Pa_StartStream(stream);
         if (err != paNoError){
@@ -605,6 +675,7 @@ int visualizer_start(int argc, char **argv){
                 mov_avg_update(&data);
                 analyze_async(&data);
             }
+            
             visualizer_render(window, &data, &ratio);
             
             visualizer_update(&data, ratio);
@@ -620,7 +691,7 @@ int visualizer_start(int argc, char **argv){
             glfwPollEvents();
         }
         
-        //sleep(1); //Pa_Sleep(1*1000);
+        //closing operations
         err = Pa_StopStream(stream);
         if (err != paNoError){
             return 0;

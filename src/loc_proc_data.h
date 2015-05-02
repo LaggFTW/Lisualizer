@@ -22,6 +22,8 @@ typedef struct {
     fftw_plan plan[2];
     int window_size;
     int transform_size;
+    double head_width; //distance between left and right audio receivers (in this case, ears), scaled by a damping factor
+    double max_damping; //maximum interaural level difference, as a normalized ratio
     int itd_cutoff; //index of highest frequency to attempt ITD on
     int ild_cutoff; //index of lowest frequency to attempt ILD on
 } localizer_data;

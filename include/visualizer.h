@@ -77,7 +77,7 @@ typedef struct {
     double *pspec_mov_avg; //moving average of previously obtained power spectra per bin
 
     //audio stream data
-    SNDFILE* inputfile;
+    SNDFILE *inputfile;
     PaUtilRingBuffer io_buffer; //interface between audio input and audio output
     PaUtilRingBuffer sample_buffer; //interface between audio input and audio processing
     float io_buf_arr[WINDOW_SIZE*2];

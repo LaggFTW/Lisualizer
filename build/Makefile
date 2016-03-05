@@ -8,7 +8,7 @@ L_DIR = ../lib
 LIBS = -lfftw3 -lm
 
 O_DIR = ./obj/
-ELF_DIR = ../bin/
+BIN_DIR = ../bin/
 
 # uncomment this once targets have been set up, and set up all and clean targets
 # .PHONY: all clean
